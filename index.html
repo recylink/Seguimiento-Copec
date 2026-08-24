@@ -130,6 +130,8 @@ tr:hover td{background:var(--g25);}
 .dot-no{background:var(--err-l);color:var(--err);}
 .dot-na{background:var(--g100);color:var(--g400);}
 .dot-fut{background:var(--g100);color:var(--g300);}
+.cse-dot.editable{cursor:pointer;transition:transform .1s;}
+.cse-dot.editable:hover{transform:scale(1.15);box-shadow:0 0 0 2px var(--brand) inset;}
 /* ANUAL */
 .ann-wrap{overflow-x:auto;}
 .ann-table{min-width:860px;border-collapse:collapse;width:100%;}
@@ -871,6 +873,68 @@ function dotCSE(v, mes){
   return `<div class="cse-dot dot-na">—</div>`;
 }
 
+// ---------- Seguimiento CSE editable (Correo / Reunión) ----------
+const CSE_ACCION_TXT = { correo: "Correo seguimiento", reunion: "Reunión seguimiento" };
+let cseDirtyEmpIds = new Set();
+let cseAutoSaveTimer = null;
+const CSE_AUTOSAVE_DELAY_MS = 1500;
+
+function dotCSEEditable(emp, key, mes){
+  if(esFuturo(mes)) return `<div class="cse-dot dot-fut">·</div>`;
+  const v = emp.cse[key][mes];
+  const cls = v===true ? "dot-ok" : v===false ? "dot-no" : "dot-na";
+  const txt = v===true ? "✓" : v===false ? "✗" : "—";
+  return `<div class="cse-dot editable ${cls}" title="Click para cambiar" onclick="cseOnToggle('${emp.id}','${key}','${mes}')">${txt}</div>`;
+}
+function cseOnToggle(empId, key, mes){
+  const emp = EMPRESAS.find(e=>e.id===empId);
+  if(!emp) return;
+  const v = emp.cse[key][mes];
+  emp.cse[key][mes] = v===true ? false : v===false ? null : true; // null → SI → NO → null
+  cseDirtyEmpIds.add(empId);
+  clearTimeout(cseAutoSaveTimer);
+  cseAutoSaveTimer = setTimeout(cseSaveAll, CSE_AUTOSAVE_DELAY_MS);
+  renderMain();
+}
+async function cseSaveAll(){
+  const ids = Array.from(cseDirtyEmpIds);
+  cseDirtyEmpIds.clear();
+  if(!ids.length) return;
+  const filas = [];
+  ids.forEach(empId=>{
+    const emp = EMPRESAS.find(e=>e.id===empId);
+    if(!emp) return;
+    Object.keys(CSE_ACCION_TXT).forEach(key=>{
+      filas.push({ empresaId: emp.id, sucursal: emp.sucursal, accion: CSE_ACCION_TXT[key], valores: emp.cse[key] });
+    });
+  });
+  const payload = { tipo: "cse", filas };
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(()=>controller.abort(), 8000);
+    const res = await fetch(DATA_SOURCE_URL, {
+      method:"POST", headers:{ "Content-Type":"text/plain;charset=utf-8" }, body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    const json = await res.json();
+    if (json.ok === false) throw new Error(json.error || "Error desconocido");
+    mnShowToast("Seguimiento CSE guardado.");
+  } catch(err){
+    console.warn("Fetch directo de CSE falló, probando formulario oculto:", err);
+    try {
+      await mnSaveViaHiddenForm(DATA_SOURCE_URL, JSON.stringify(payload));
+      mnShowToast("Seguimiento CSE guardado.");
+    } catch(err2){
+      console.error(err2);
+      ids.forEach(id=>cseDirtyEmpIds.add(id)); // reintenta más adelante, no se pierde el cambio
+      mnShowToast("No se pudo guardar el seguimiento CSE, reintentando…", true);
+      clearTimeout(cseAutoSaveTimer);
+      cseAutoSaveTimer = setTimeout(cseSaveAll, CSE_AUTOSAVE_DELAY_MS * 4);
+    }
+  }
+}
+
 // ============================================================
 // PANEL FILTRO RESIDUOS — muestra todos los residuos del mes
 // y permite activar/desactivar cuáles se muestran en la tabla
@@ -1359,7 +1423,7 @@ function renderCSE(emp, modo){
             ${keys.map(({key,lbl},i)=>`
               <tr style="${i%2===0?'':'background:var(--g25)'}">
                 <td style="padding:8px 16px;font-size:11px;font-weight:700;color:var(--g700);white-space:nowrap;">${lbl}</td>
-                ${meses.map(m=>`<td style="text-align:center;padding:6px 4px;">${dotCSE(emp.cse[key][m],m)}</td>`).join("")}
+                ${meses.map(m=>`<td style="text-align:center;padding:6px 4px;">${dotCSEEditable(emp,key,m)}</td>`).join("")}
               </tr>`).join("")}
           </tbody>
         </table>
