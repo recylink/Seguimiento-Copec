@@ -209,6 +209,18 @@ tr:hover td{background:var(--g25);}
 .mn-cfg label{display:block;font-size:10.5px;font-weight:700;color:var(--g700);margin-bottom:5px;}
 .mn-cfg input[type=text]{width:100%;padding:7px 10px;border:1.5px solid var(--bd);border-radius:7px;font-family:inherit;font-size:11.5px;color:var(--tx);background:#fff;outline:none;margin-bottom:8px;}
 .mn-cfg .hint{display:block;font-size:10px;color:var(--tx2);margin-bottom:8px;line-height:1.5;}
+.mn-sb-tag{font-size:9px;font-weight:700;color:var(--g500);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px;}
+.mn-newbtn{cursor:pointer;color:var(--g400);font-size:15px;line-height:1;}
+.mn-newbtn:hover{color:var(--brand);}
+.mn-newpanel{display:none;padding:10px 14px;border-bottom:1px solid var(--bd);background:var(--g50);}
+.mn-newpanel.open{display:block;}
+.mn-newpanel label{display:block;font-size:10px;font-weight:700;color:var(--g700);margin:6px 0 3px;}
+.mn-newpanel label:first-child{margin-top:0;}
+.mn-newpanel input,.mn-newpanel select{width:100%;padding:6px 8px;border:1.5px solid var(--bd);border-radius:6px;font-family:inherit;font-size:11px;color:var(--tx);background:#fff;outline:none;}
+.mn-newpanel .mn-newactions{display:flex;gap:6px;margin-top:8px;}
+.mn-tipo-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 2px;}
+.mn-tipo-row label{font-size:10.5px;font-weight:700;color:var(--g500);}
+.mn-tipo-row select{padding:5px 8px;border:1.5px solid var(--bd);border-radius:6px;font-family:inherit;font-size:11px;color:var(--tx);background:#fff;outline:none;}
 th.mn-mc{width:32px;text-align:center;}
 th.mn-rc{width:32px;text-align:center;}
 td.mn-mc{text-align:center;vertical-align:middle;}
@@ -2401,6 +2413,7 @@ function mnRowsToSessions(rows){
   while (i < rows.length){
     const row = rows[i] || [];
     if (mnIsSessionHeader(row)){
+      const headerRow = i + 1; // fila real (1-indexed) en el Sheet
       const title = (row[0] || "").trim();
       let r = i + 1;
       if (r < rows.length && mnIsSubHeaderRow(rows[r] || [])) r++;
@@ -2423,13 +2436,62 @@ function mnRowsToSessions(rows){
         });
         r++;
       }
-      out.push({ title, items });
+      out.push({ headerRow, title, items });
       i = r;
     } else {
       i++;
     }
   }
   return out;
+}
+
+// ---------- Tipo de reunión (Oficina Central / Sucursal) ----------
+// Se codifica como sufijo en el propio título, después de " · ", porque
+// mnIsSessionHeader exige que la celda empiece con "minuta" — así que la
+// etiqueta nunca puede ir de prefijo.
+// Ej: "Minuta 04/11/2025 · Oficina Central" / "Minuta 04/11/2025 · Sucursal: Rancagua"
+function mnParseTitle(title){
+  const t = (title || "").trim();
+  const idx = t.indexOf(" · ");
+  if (idx === -1) return { base: t, tipo: null, sucursal: null };
+  const base = t.slice(0, idx).trim();
+  const tag = t.slice(idx + 3).trim();
+  if (/^oficina central$/i.test(tag)) return { base, tipo: "central", sucursal: null };
+  const m = /^sucursal:\s*(.+)$/i.exec(tag);
+  if (m) return { base, tipo: "sucursal", sucursal: m[1].trim() };
+  return { base: t, tipo: null, sucursal: null }; // sufijo no reconocido: se deja tal cual
+}
+function mnBuildTitle(base, tipo, sucursal){
+  let t = (base || "").trim();
+  if (tipo === "central") t += " · Oficina Central";
+  else if (tipo === "sucursal" && sucursal) t += " · Sucursal: " + sucursal;
+  return t;
+}
+
+// ---------- Fecha para ordenar cronológicamente ----------
+const MN_MESES_TXT = {enero:0,febrero:1,marzo:2,abril:3,mayo:4,junio:5,julio:6,agosto:7,septiembre:8,setiembre:8,octubre:9,noviembre:10,diciembre:11};
+function mnExtractDate(base){
+  let m = /(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/.exec(base || "");
+  if (m) return new Date(+m[3], +m[2]-1, +m[1]);
+  m = /(\d{1,2})\s+de\s+([a-záéíóúñ]+)(?:\s+de\s+(\d{4}))?/i.exec(base || "");
+  if (m){
+    const mi = MN_MESES_TXT[m[2].toLowerCase()];
+    if (mi !== undefined) return new Date(m[3] ? +m[3] : new Date().getFullYear(), mi, +m[1]);
+  }
+  return null;
+}
+// Devuelve mnSessions con su índice original, ordenados más reciente primero
+// (las minutas sin fecha reconocible en el título quedan al final, en el
+// orden en que se agregaron).
+function mnSesionesOrdenadas(){
+  return mnSessions
+    .map((sess, idx) => ({ sess, idx, d: mnExtractDate(mnParseTitle(sess.title).base) }))
+    .sort((a, b) => {
+      if (a.d && b.d) return b.d - a.d;
+      if (a.d) return -1;
+      if (b.d) return 1;
+      return b.idx - a.idx;
+    });
 }
 
 function mnLoadConfig(){ try{ const raw = localStorage.getItem(MN_LS_SCRIPT); if (raw) mnScriptUrl = raw; }catch(e){} }
@@ -2463,9 +2525,19 @@ function mnFetchSheet(silencioso){
       return;
     }
 
-    const prevTitle = mnSessions[mnActiveIdx] ? mnSessions[mnActiveIdx].title : null;
+    const prev = mnSessions[mnActiveIdx] || null;
+    // Minutas creadas desde el visor que todavía no se guardan en el Sheet
+    // (sin headerRow) — no vienen en la respuesta del Apps Script, así que
+    // se conservan para no perderlas si el refresco automático llega antes
+    // que el autoguardado.
+    const sinGuardar = mnSessions.filter(s => !s.headerRow);
     mnSessions = mnRowsToSessions(payload.rows || []);
-    const matchIdx = prevTitle ? mnSessions.findIndex(s => s.title === prevTitle) : -1;
+    sinGuardar.forEach(s => { if (!mnSessions.some(x => x.title === s.title)) mnSessions.push(s); });
+    let matchIdx = -1;
+    if (prev){
+      matchIdx = prev.headerRow ? mnSessions.findIndex(s => s.headerRow === prev.headerRow) : -1;
+      if (matchIdx === -1) matchIdx = mnSessions.findIndex(s => s.title === prev.title);
+    }
     mnActiveIdx = matchIdx !== -1 ? matchIdx : (mnSessions.length ? mnSessions.length - 1 : 0);
     mnCacheData();
     mnDirty = false;
@@ -2665,23 +2737,88 @@ function mnGuardarScriptUrl(){
   if (mnDirty) mnScheduleAutoSave();
 }
 
+// ---------- Nueva minuta ----------
+let mnNuevaOpen = false;
+function mnToggleNueva(){ mnNuevaOpen = !mnNuevaOpen; renderSidebar(); }
+function mnOnNuevaTipoChange(v){
+  const wrap = mnEl("mnNuevaSucursalWrap");
+  if (wrap) wrap.style.display = v === "sucursal" ? "block" : "none";
+}
+function mnCrearNueva(){
+  const fechaInput = mnEl("mnNuevaFecha");
+  const tipoInput = mnEl("mnNuevaTipo");
+  const sucSelect = mnEl("mnNuevaSucursal");
+  const fecha = fechaInput ? fechaInput.value : "";
+  if (!fecha){ mnShowToast("Indica la fecha de la minuta.", true); return; }
+  const [y, m, d] = fecha.split("-");
+  const base = `Minuta ${d}/${m}/${y}`;
+  const tipo = tipoInput ? tipoInput.value : "";
+  const sucursal = tipo === "sucursal" ? (sucSelect ? sucSelect.value : "") : null;
+  if (tipo === "sucursal" && !sucursal){ mnShowToast("Selecciona la sucursal.", true); return; }
+  const title = mnBuildTitle(base, tipo || null, sucursal);
+  if (mnSessions.some(s => s.title.trim().toLowerCase() === title.trim().toLowerCase())){
+    mnShowToast("Ya existe una minuta con esa fecha y tipo.", true); return;
+  }
+  mnSessions.push({ headerRow: null, title, items: [] });
+  mnActiveIdx = mnSessions.length - 1;
+  mnFilter = "todos";
+  mnNuevaOpen = false;
+  mnMarkDirty();
+  vistaGlobal = "minutas";
+  renderSidebar(); renderMain(); mnUpdateAccessBtn();
+  mnShowToast("Minuta creada — agrega ítems y se guardará sola en el Sheet.");
+}
+function mnNuevaPanelHtml(){
+  if (!mnNuevaOpen) return "";
+  const hoy = new Date().toISOString().slice(0,10);
+  const sucursales = (typeof EMPRESAS !== "undefined" ? EMPRESAS : []);
+  return `<div class="mn-newpanel open">
+    <label>Fecha</label>
+    <input type="date" id="mnNuevaFecha" value="${hoy}">
+    <label>Tipo de reunión</label>
+    <select id="mnNuevaTipo" onchange="mnOnNuevaTipoChange(this.value)">
+      <option value="central">Oficina Central</option>
+      <option value="sucursal">Sucursal</option>
+    </select>
+    <div id="mnNuevaSucursalWrap" style="display:none;">
+      <label>Sucursal</label>
+      <select id="mnNuevaSucursal">
+        ${sucursales.map(e=>`<option value="${mnEscapeHtml(e.sucursal)}">${mnEscapeHtml(e.sucursal)}</option>`).join("")}
+      </select>
+    </div>
+    <div class="mn-newactions">
+      <button class="mn-topbtn primary" type="button" onclick="mnCrearNueva()">Crear minuta</button>
+      <button class="mn-topbtn" type="button" onclick="mnToggleNueva()">Cancelar</button>
+    </div>
+  </div>`;
+}
+
 // ---------- Render sidebar ----------
 function mnSidebarHtml(){
   let html = `<div class="sb-section" style="display:flex;justify-content:space-between;align-items:center;">
     <span>Minutas</span>
-    <span style="cursor:pointer;color:var(--g400);" title="Actualizar minutas" onclick="event.stopPropagation();mnFetchSheet(false);">↻</span>
+    <span style="display:flex;gap:10px;align-items:center;">
+      <span class="mn-newbtn" title="Nueva minuta" onclick="event.stopPropagation();mnToggleNueva();">＋</span>
+      <span style="cursor:pointer;color:var(--g400);" title="Actualizar minutas" onclick="event.stopPropagation();mnFetchSheet(false);">↻</span>
+    </span>
   </div>`;
+  html += mnNuevaPanelHtml();
   if (!mnSessions.length){
     html += `<div class="mn-sb-empty">${mnStatus.state==="err" ? "No se pudo cargar la pestaña 'Minuta'." : "Cargando minutas…"}</div>`;
     return html;
   }
-  mnSessions.forEach((sess, idx) => {
+  mnSesionesOrdenadas().forEach(({sess, idx}) => {
     const total = sess.items.length;
     const done = sess.items.filter(i=>i.cumplido).length;
     const act = vistaGlobal === "minutas" && idx === mnActiveIdx;
-    const title = sess.title.trim() || "(Sin título)";
+    const p = mnParseTitle(sess.title);
+    const title = p.base.trim() || "(Sin título)";
+    const tagLabel = p.tipo === "central" ? "🏢 Oficina Central" : p.tipo === "sucursal" ? ("📍 " + (p.sucursal || "Sucursal")) : "";
     html += `<div class="sb-suc ${act?'active':''}" onclick="mnSetActive(${idx})" style="display:grid;grid-template-columns:1fr auto;gap:4px;align-items:center;padding:7px 14px;cursor:pointer;">
-      <div class="sb-suc-name" style="font-size:11px;font-weight:${act?700:500};color:${act?EMPRESA_COLOR:'var(--g700)'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${mnEscapeHtml(title)}</div>
+      <div style="overflow:hidden;">
+        <div class="sb-suc-name" style="font-size:11px;font-weight:${act?700:500};color:${act?EMPRESA_COLOR:'var(--g700)'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${mnEscapeHtml(title)}</div>
+        ${tagLabel?`<div class="mn-sb-tag">${mnEscapeHtml(tagLabel)}</div>`:""}
+      </div>
       <div class="sb-suc-pct" style="font-size:10px;font-weight:700;color:${done===total&&total?'var(--ok)':'var(--g400)'};">${done}/${total}</div>
     </div>`;
   });
@@ -2731,7 +2868,7 @@ function mnRenderKPIs(){
   const pend = total - done;
   const pct = total ? Math.round(done/total*100) : 0;
   kpiRow.innerHTML = `
-    <div class="kpi"><div class="kpi-lbl">Ítems en esta minuta</div><div class="kpi-val">${total}</div><div class="kpi-desc">${mnEscapeHtml(sess ? (sess.title.trim() || "Sin título") : "—")}</div></div>
+    <div class="kpi"><div class="kpi-lbl">Ítems en esta minuta</div><div class="kpi-val">${total}</div><div class="kpi-desc">${mnEscapeHtml(sess ? (mnParseTitle(sess.title).base.trim() || "Sin título") : "—")}</div></div>
     <div class="kpi"><div class="kpi-lbl">Revisados</div><div class="kpi-val" style="color:var(--brand)">${reviewed}</div><div class="kpi-desc">Tratados en la reunión</div></div>
     <div class="kpi"><div class="kpi-lbl">Cumplidos</div><div class="kpi-val" style="color:var(--ok)">${done}</div><div class="kpi-desc">Resueltos</div></div>
     <div class="kpi"><div class="kpi-lbl">Pendientes</div><div class="kpi-val" style="color:var(--err)">${pend}</div><div class="kpi-desc">Sin cumplir aún</div></div>
@@ -2755,16 +2892,30 @@ function mnRenderCard(){
     return true;
   });
 
+  const p = mnParseTitle(sess.title);
+  const sucursales = (typeof EMPRESAS !== "undefined" ? EMPRESAS : []);
+
   let html = `
     <div class="card-header">
       <div class="card-title-wrap">
-        <div><div class="card-title">${mnEscapeHtml(sess.title.trim() || "Sin título")}</div>
+        <div><div class="card-title">${mnEscapeHtml(p.base.trim() || "Sin título")}</div>
         <div class="card-sub">${total} ítem${total===1?"":"s"} de seguimiento</div></div>
       </div>
       <div class="prog-wrap">
         <div class="prog-bg"><div class="prog-fill" style="width:${pct}%;background:var(--ok);"></div></div>
         <span class="prog-lbl">${pct}%</span>
       </div>
+    </div>
+    <div class="mn-tipo-row">
+      <label>Tipo de reunión:</label>
+      <select onchange="mnOnTipoChange(this.value)">
+        <option value="" ${!p.tipo?"selected":""}>Sin especificar</option>
+        <option value="central" ${p.tipo==="central"?"selected":""}>Oficina Central</option>
+        <option value="sucursal" ${p.tipo==="sucursal"?"selected":""}>Sucursal</option>
+      </select>
+      ${p.tipo==="sucursal" ? `<select onchange="mnOnSucursalChange(this.value)">
+        ${sucursales.map(e=>`<option value="${mnEscapeHtml(e.sucursal)}" ${e.sucursal===p.sucursal?"selected":""}>${mnEscapeHtml(e.sucursal)}</option>`).join("")}
+      </select>` : ""}
     </div>
     <div class="filters">
       <button class="fbtn ${mnFilter==='todos'?'on':''}" onclick="mnSetFiltro('todos')" type="button">Todos (${total})</button>
@@ -2807,6 +2958,20 @@ function mnRenderCard(){
   card.innerHTML = html;
 }
 
+function mnOnTipoChange(tipo){
+  const sess = mnSessions[mnActiveIdx];
+  const p = mnParseTitle(sess.title);
+  const sucursales = (typeof EMPRESAS !== "undefined" ? EMPRESAS : []);
+  const sucursalDefault = sucursales.length ? sucursales[0].sucursal : "";
+  sess.title = mnBuildTitle(p.base, tipo || null, tipo === "sucursal" ? (p.sucursal || sucursalDefault) : null);
+  mnMarkDirty(); mnRenderCard(); renderSidebar();
+}
+function mnOnSucursalChange(nombre){
+  const sess = mnSessions[mnActiveIdx];
+  const p = mnParseTitle(sess.title);
+  sess.title = mnBuildTitle(p.base, "sucursal", nombre);
+  mnMarkDirty(); mnRenderCard(); renderSidebar();
+}
 function mnOnCheck(i, val){ mnSessions[mnActiveIdx].items[i].cumplido = val; mnMarkDirty(); mnRenderKPIs(); mnRenderCard(); renderSidebar(); }
 function mnOnRevisado(i, val){ mnSessions[mnActiveIdx].items[i].revisado = val; mnMarkDirty(); }
 function mnOnBadgeToggle(i){ mnSessions[mnActiveIdx].items[i].cumplido = !mnSessions[mnActiveIdx].items[i].cumplido; mnMarkDirty(); mnRenderKPIs(); mnRenderCard(); renderSidebar(); }
